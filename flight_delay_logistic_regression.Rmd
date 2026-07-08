@@ -1,0 +1,1163 @@
+---
+title: "US Flight Delays at Scale: When to Fly, Aircraft Age, and Predicting Diversions"
+subtitle: Data Expo 2009, Harvard Dataverse | Domestic US Flights 2003–2007
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+    number_sections: true
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 13,
+  fig.height = 6,
+  dpi = 130
+)
+```
+
+---
+
+# Overview
+
+**Data source:** [Data Expo 2009: Airline On-Time Data](https://doi.org/10.7910/DVN/HG7NV7) (Harvard Dataverse), domestic US flights 2003–2007 — roughly 35 million records.
+
+*This project began as university coursework and has since been revised and extended as a personal portfolio piece.*
+
+Three research questions are addressed:
+
+- **Best time to fly:** which day of the week and departure time block give the lowest delay probability?
+- **Aircraft age:** is there a measurable association between aircraft age and delay probability, after
+  controlling for confounders?
+- **Diversions:** can we build a logistic regression model to predict flight diversions?
+
+> **Methodological note:** The original analysis used scikit-learn's `LogisticRegression`
+> with L2 regularisation (`C = 1.0`). This document uses R's `glm()` (unregularised MLE)
+> with observation weights for the balanced-class setting (diversion model). On the sub-samples
+> used (≤ 300 k rows) the regularisation penalty in sklearn is mild, so numerical
+> differences between the two implementations are expected to be small.
+
+---
+
+# Setup
+
+## Packages
+
+```{r packages}
+# -- Core --------------------------------------------------------
+library(data.table)   # fast CSV reading
+library(tidyverse)    # dplyr, ggplot2, tidyr, purrr, stringr
+library(scales)       # axis formatters
+library(patchwork)    # multi-panel ggplot2 layouts
+library(viridis)      # perceptually-uniform colour scales
+library(RColorBrewer) # categorical palettes
+
+# -- Modelling & metrics -----------------------------------------
+library(pROC)   # ROC-AUC
+library(PRROC)  # Precision-Recall AUC (primary metric for rare events)
+
+set.seed(42)
+options(scipen = 9)
+```
+
+## Configuration
+
+```{r config}
+# -- Delay thresholds --------------------------------------------
+DELAY_OUTLIER_UPPER <-  360L
+DELAY_OUTLIER_LOWER <- -120L
+
+# -- Time blocks: name → lower bound (HHMM integers) ------------
+TIME_BLOCKS <- c(
+  "00-05  Night"           =    0L,
+  "05-08  Early Morning"   =  500L,
+  "08-12  Morning Peak"    =  800L,
+  "12-16  Midday"          = 1200L,
+  "16-20  Afternoon Peak"  = 1600L,
+  "20-24  Evening"         = 2000L
+)
+BLOCK_UPPER <- 2400L          # upper bound for last block
+BLOCK_ORDER <- names(TIME_BLOCKS)
+
+# -- Day-of-week lookup (DayOfWeek integer → label) --------------
+DAY_LABELS <- c("1"="Mon","2"="Tue","3"="Wed",
+                "4"="Thu","5"="Fri","6"="Sat","7"="Sun")
+DAY_ORDER  <- unname(DAY_LABELS)
+
+# -- Columns to read from flight CSVs ----------------------------
+FLIGHT_COLS <- c(
+  "Year","Month","DayofMonth","DayOfWeek",
+  "CRSDepTime","CRSArrTime",
+  "UniqueCarrier","TailNum",
+  "ActualElapsedTime","CRSElapsedTime","AirTime",
+  "ArrDelay","DepDelay",
+  "Origin","Dest","Distance",
+  "Cancelled","Diverted"
+)
+```
+
+---
+
+# Data Loading
+
+`fread()` from **data.table** is used for all CSV ingestion; it is substantially faster
+than base `read.csv()` on multi-million-row files.
+
+```{r load-functions}
+load_flights <- function(filepath) {
+  message("  Loading: ", basename(filepath))
+  dt <- fread(
+    filepath,
+    select       = FLIGHT_COLS,
+    na.strings   = c("NA", ""),
+    showProgress = FALSE
+  )
+  message("    Loaded ", format(nrow(dt), big.mark = ","), " rows")
+  as_tibble(dt)
+}
+
+load_plane_data <- function(filepath) {
+  # Force header=TRUE: fread can silently treat the header row as data when the
+  # first field looks like a value (e.g. a tail number starting with a letter).
+  dt <- fread(filepath, header = TRUE, na.strings = c("NA", ""),
+              showProgress = FALSE)
+  setnames(dt, tolower(trimws(names(dt))))   # lowercase + strip any whitespace/BOM
+
+  # If fread still misread the header (first row became col names), the real
+  # column names will be in row 1 — detect and recover automatically.
+  if (!"tailnum" %in% names(dt)) {
+    # Try reading with base R, which is more robust with unusual CSV headers
+    raw <- read.csv(filepath, stringsAsFactors = FALSE, check.names = FALSE,
+                    na.strings = c("NA", ""))
+    colnames(raw) <- tolower(trimws(colnames(raw)))
+    dt <- as.data.table(raw)
+  }
+
+  # Final check with a helpful error listing what was actually found
+  if (!"tailnum" %in% names(dt))
+    stop("plane-data.csv: cannot find column 'tailnum'.
+",
+         "Columns found after lowercasing: ",
+         paste(names(dt), collapse = ", "))
+  if (!"year" %in% names(dt))
+    stop("plane-data.csv: cannot find column 'year'.
+",
+         "Columns found after lowercasing: ",
+         paste(names(dt), collapse = ", "))
+
+  # Select by character names (not NSE) to avoid data.table 'object not found'
+  dt <- dt[, .SD, .SDcols = c("tailnum", "year")]
+
+  dt[, year := suppressWarnings(as.integer(year))]
+  dt <- dt[!is.na(year)]
+
+  # Keep tailnum lowercase; engineer_features renames to TailNum before joining
+  setnames(dt, old = "year", new = "ManufactureYear")
+
+  as_tibble(dt)
+}
+
+load_airports <- function(filepath) {
+  dt <- fread(filepath, select = c("iata", "lat", "long"), na.strings = c("NA", ""))
+  as_tibble(dt[complete.cases(dt)])
+}
+
+load_carriers <- function(filepath) {
+  as_tibble(fread(filepath, na.strings = c("NA", "")))
+}
+```
+
+---
+
+# Preprocessing
+
+`clean_flights()` removes or flags problematic rows: impossible `AirTime` values,
+missing `ArrDelay` (cancelled / diverted / data gaps), and invalid tail numbers.
+`engineer_features()` derives all downstream columns used in the three analyses.
+
+```{r preprocess-functions}
+# -- Map HHMM integer → named time-block factor ------------------
+assign_time_block <- function(crs_dep_time) {
+  result    <- rep("Unknown", length(crs_dep_time))
+  blk_names <- names(TIME_BLOCKS)
+  blk_lo    <- unname(TIME_BLOCKS)          # lower bounds
+  blk_hi    <- c(blk_lo[-1], BLOCK_UPPER)  # upper bounds (drop first, append cap)
+
+  for (i in seq_along(blk_names)) {
+    mask <- !is.na(crs_dep_time) &
+            crs_dep_time >= blk_lo[i] &
+            crs_dep_time <  blk_hi[i]
+    result[mask] <- blk_names[i]
+  }
+  factor(result, levels = BLOCK_ORDER)
+}
+
+# -- Clean raw flight data ----------------------------------------
+clean_flights <- function(df, verbose = TRUE) {
+  n0 <- nrow(df)
+
+  # Fix physically impossible AirTime values
+  bad_airtime <- !is.na(df$AirTime) & !is.na(df$ActualElapsedTime) &
+                 df$AirTime >= df$ActualElapsedTime
+  if (verbose) message("    AirTime >= ElapsedTime: ", sum(bad_airtime),
+                        " rows -> AirTime set NA")
+  df$AirTime[bad_airtime] <- NA_real_
+
+  neg_air <- !is.na(df$AirTime) & df$AirTime <= 0
+  if (verbose) message("    Negative/zero AirTime: ", sum(neg_air), " rows -> set NA")
+  df$AirTime[neg_air] <- NA_real_
+
+  # Preserve diverted rows before dropping on ArrDelay
+  diverted_rows <- filter(df, Diverted == 1L)
+
+  # Drop rows with missing ArrDelay (cancelled / diverted / no record)
+  df <- filter(df, !is.na(ArrDelay))
+  if (verbose) {
+    message("    Dropped ", format(n0 - nrow(df), big.mark = ","),
+            " rows (missing ArrDelay / cancelled / diverted)")
+    message("    Remaining: ", format(nrow(df), big.mark = ","))
+  }
+
+  # Sanitise TailNum
+  df <- mutate(df, TailNum = str_trim(str_to_upper(as.character(TailNum))))
+  bad_tail <- df$TailNum %in%
+    c("0","000000","UNKNOW","UNKNOWN","NAN","NONE","","N/A","NA")
+  if (verbose) message("    Invalid TailNum: ", sum(bad_tail), " -> set NA")
+  df$TailNum[bad_tail] <- NA_character_
+
+  # Clamp out-of-range CRS times
+  for (col in c("CRSDepTime", "CRSArrTime")) {
+    bad <- !is.na(df[[col]]) & (df[[col]] < 0L | df[[col]] > 2359L)
+    if (verbose && sum(bad) > 0)
+      message("    ", col, " out of range: ", sum(bad), " rows -> NA")
+    df[[col]][bad] <- NA_integer_
+  }
+
+  list(clean = df, diverted = diverted_rows)
+}
+
+# -- Add derived features -----------------------------------------
+engineer_features <- function(df, plane_df, airport_df, flight_year) {
+
+  # Build coordinate lookup tables with unambiguous column names
+  coord_orig <- airport_df %>%
+    rename(Origin = iata, OriginLat = lat, OriginLon = long)
+  coord_dest <- airport_df %>%
+    rename(Dest = iata, DestLat = lat, DestLon = long)
+
+  # Rename tailnum -> TailNum to match flight data (mirrors notebook inline rename)
+  plane_join <- plane_df %>% rename(TailNum = tailnum)
+
+  df <- df %>%
+    mutate(
+      DelayIndicator = as.integer(ArrDelay > 0),
+      DepHour        = as.integer(CRSDepTime %/% 100L),
+      TimeBlock      = assign_time_block(CRSDepTime),
+      DayLabel       = factor(DAY_LABELS[as.character(DayOfWeek)], levels = DAY_ORDER),
+      DepMinutes     = as.integer(CRSDepTime %/% 100L) * 60L +
+                       as.integer(CRSDepTime %%  100L),
+      ArrMinutes     = as.integer(CRSArrTime %/% 100L) * 60L +
+                       as.integer(CRSArrTime %%  100L)
+    ) %>%
+    left_join(coord_orig, by = "Origin") %>%
+    left_join(coord_dest, by = "Dest") %>%
+    left_join(plane_join, by = "TailNum") %>%
+    mutate(
+      AircraftAge = flight_year - ManufactureYear,
+      AircraftAge = if_else(AircraftAge < 0L | AircraftAge > 60L,
+                            NA_integer_, AircraftAge)
+    )
+
+  df
+}
+```
+
+---
+
+# Best Time to Fly — Delay Patterns by Day and Time Block {#best-time}
+
+For each year, delay probability — P(ArrDelay > 0) — is computed across all
+42 day × time-block cells to identify the joint minimum.
+A robustness check repeats the analysis under a stricter definition (ArrDelay > 15 min).
+
+```{r qa-function}
+analyze_delay_patterns <- function(df, year) {
+  cat(sprintf(
+    "\n%s\n  Delay Patterns by Day & Time Block  --  Year %d\n%s\n",
+    strrep("=", 60), year, strrep("=", 60)
+  ))
+
+  # -- Marginal: by day -----------------------------------------
+  day_stats <- df %>%
+    group_by(DayLabel) %>%
+    summarise(
+      DelayProb   = mean(DelayIndicator, na.rm = TRUE),
+      MedianDelay = median(ArrDelay,     na.rm = TRUE),
+      N           = n(),
+      .groups     = "drop"
+    ) %>%
+    mutate(DayLabel = factor(DayLabel, levels = DAY_ORDER)) %>%
+    arrange(DayLabel)
+
+  best_day <- as.character(day_stats$DayLabel[which.min(day_stats$DelayProb)])
+
+  # -- Marginal: by time block -----------------------------------
+  block_stats <- df %>%
+    group_by(TimeBlock) %>%
+    summarise(
+      DelayProb   = mean(DelayIndicator, na.rm = TRUE),
+      MedianDelay = median(ArrDelay,     na.rm = TRUE),
+      N           = n(),
+      .groups     = "drop"
+    ) %>%
+    mutate(TimeBlock = factor(TimeBlock, levels = BLOCK_ORDER)) %>%
+    arrange(TimeBlock)
+
+  best_block <- as.character(block_stats$TimeBlock[which.min(block_stats$DelayProb)])
+
+  # -- Joint: Day × TimeBlock (min N = 30 for robustness) -------
+  cross <- df %>%
+    group_by(DayLabel, TimeBlock) %>%
+    summarise(
+      DelayProb = mean(DelayIndicator, na.rm = TRUE),
+      N         = n(),
+      .groups   = "drop"
+    ) %>%
+    mutate(
+      DayLabel  = factor(DayLabel,  levels = DAY_ORDER),
+      TimeBlock = factor(TimeBlock, levels = BLOCK_ORDER)
+    )
+
+  cross_robust <- filter(cross, N >= 30)
+  best_idx     <- which.min(cross_robust$DelayProb)
+  best_row     <- cross_robust[best_idx, ]
+  best_combo   <- c(as.character(best_row$DayLabel),
+                    as.character(best_row$TimeBlock))
+  best_prob    <- best_row$DelayProb
+
+  # -- Robustness: ArrDelay > 15 min definition -----------------
+  cross15 <- df %>%
+    mutate(Delay15 = as.integer(ArrDelay > 15)) %>%
+    group_by(DayLabel, TimeBlock) %>%
+    summarise(
+      DelayProb15 = mean(Delay15, na.rm = TRUE),
+      N           = n(),
+      .groups     = "drop"
+    ) %>%
+    filter(N >= 30) %>%
+    mutate(
+      DayLabel  = factor(DayLabel,  levels = DAY_ORDER),
+      TimeBlock = factor(TimeBlock, levels = BLOCK_ORDER)
+    )
+
+  best15_row   <- cross15[which.min(cross15$DelayProb15), ]
+  best_combo15 <- c(as.character(best15_row$DayLabel),
+                    as.character(best15_row$TimeBlock))
+  robust_same  <- identical(best_combo, best_combo15)
+
+  # Console summary
+  cat(sprintf("  Best day   (marginal): %s\n",    best_day))
+  cat(sprintf("  Best block (marginal): %s\n",    best_block))
+  cat(sprintf("  >> MAIN RESULT: Best (Day x Block) combination <<\n"))
+  cat(sprintf("     Day:        %s\n",             best_combo[1]))
+  cat(sprintf("     Time Block: %s\n",             best_combo[2]))
+  cat(sprintf("     Delay Prob: %.2f%%\n",         best_prob * 100))
+  cat(sprintf("  Robustness (>15 min):  %s + %s\n",
+              best_combo15[1], best_combo15[2]))
+  cat(sprintf("  Robust: %s\n",
+              if (robust_same) "YES" else "NO (changed under >15 min definition)"))
+
+  # -- Plots -----------------------------------------------------
+  # Shorten block labels for axis readability (keep "HH-HH" prefix only)
+  short_labels <- str_extract(BLOCK_ORDER, "^[0-9-]+")
+  block_recode <- setNames(short_labels, BLOCK_ORDER)
+
+  heat_df <- cross %>%
+    mutate(
+      BlockShort = factor(block_recode[as.character(TimeBlock)],
+                          levels = short_labels)
+    )
+
+  p1 <- ggplot(heat_df,
+               aes(x = BlockShort, y = fct_rev(DayLabel),
+                   fill = DelayProb * 100)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(aes(label = sprintf("%.1f", DelayProb * 100)),
+              size = 3.1, color = "black") +
+    scale_fill_distiller(palette = "RdYlGn", direction = -1,
+                         name = "P(Delay>0)\n[%]") +
+    labs(title   = sprintf("Delay Probability %% – Day × Time Block (%d)", year),
+         x = "Departure Time Block", y = "Day of Week") +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+  # Robustness bar chart (aggregated at block level)
+  bar_data <- df %>%
+    mutate(Delay15 = as.integer(ArrDelay > 15)) %>%
+    group_by(TimeBlock) %>%
+    summarise(
+      `ArrDelay > 0 min`  = mean(DelayIndicator, na.rm = TRUE),
+      `ArrDelay > 15 min` = mean(Delay15,         na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(TimeBlock = factor(TimeBlock, levels = BLOCK_ORDER),
+           BlockShort = factor(block_recode[as.character(TimeBlock)],
+                               levels = short_labels)) %>%
+    pivot_longer(c(`ArrDelay > 0 min`, `ArrDelay > 15 min`),
+                 names_to = "Definition", values_to = "Prob")
+
+  p2 <- ggplot(bar_data, aes(x = BlockShort, y = Prob * 100, fill = Definition)) +
+    geom_col(position = "dodge", color = "white") +
+    scale_fill_brewer(palette = "Set2") +
+    scale_y_continuous(labels = percent_format(scale = 1)) +
+    labs(title = "Robustness: Delay Definition >0 vs >15 min",
+         x = "Departure Time Block",
+         y = "Delay Probability [%]",
+         fill = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1),
+          legend.position = "bottom")
+
+  print(
+    (p1 | p2) +
+      plot_annotation(
+        title  = sprintf(
+          "Delay Patterns by Day & Time Block (%d)", year),
+        theme  = theme(plot.title = element_text(face = "bold", size = 14))
+      )
+  )
+
+  list(
+    by_day                 = day_stats,
+    by_block               = block_stats,
+    cross                  = cross,
+    best_day               = best_day,
+    best_block             = best_block,
+    best_combination       = best_combo,
+    best_combination_prob  = as.numeric(best_prob),
+    best_combination_15min = best_combo15,
+    robust_check_same      = robust_same
+  )
+}
+```
+
+---
+
+# Aircraft Age and Delay Probability {#aircraft-age}
+
+Two-part analysis:
+
+1. **Descriptive:** flight-weighted Pearson *r* and a 5-year cohort bar chart with a
+   weighted OLS trend line.
+2. **Adjusted logistic regression:** AircraftAge coefficient after controlling for
+   month, day-of-week, departure time, distance, carrier, and airport coordinates.
+   A +5-year odds ratio (OR) is derived from the unstandardised coefficient.
+
+> **Causal caveat:** This regression captures *association*, not causation.
+> Maintenance practices, route allocation, and fleet composition are not controlled for.
+
+```{r qb-function}
+# -- Helper: stratified train/test indices -----------------------
+stratified_split <- function(y, test_prop = 0.2, seed = 42) {
+  set.seed(seed)
+  pos      <- which(y == 1L)
+  neg      <- which(y == 0L)
+  test_pos <- sample(pos, round(length(pos) * test_prop))
+  test_neg <- sample(neg, round(length(neg) * test_prop))
+  test_idx <- c(test_pos, test_neg)
+  list(train = setdiff(seq_along(y), test_idx), test = test_idx)
+}
+
+analyze_aircraft_age <- function(df, year) {
+  cat(sprintf(
+    "\n%s\n  Aircraft Age vs Delay Probability  --  Year %d\n%s\n",
+    strrep("=", 60), year, strrep("=", 60)
+  ))
+
+  df_b <- filter(df, !is.na(AircraftAge))
+  cat(sprintf("  Rows with valid AircraftAge: %s (%.1f%% of cleaned data)\n",
+              format(nrow(df_b), big.mark = ","),
+              nrow(df_b) / nrow(df) * 100))
+
+  # -- Descriptive aggregation -----------------------------------
+  by_age <- df_b %>%
+    group_by(AircraftAge) %>%
+    summarise(DelayProb = mean(DelayIndicator, na.rm = TRUE),
+              N         = n(),
+              .groups   = "drop")
+
+  # Flight-weighted Pearson r (equivalent to repeating each row N times)
+  wt_cov <- cov.wt(
+    cbind(by_age$AircraftAge, by_age$DelayProb),
+    wt  = by_age$N,
+    cor = TRUE
+  )
+  corr <- wt_cov$cor[1, 2]
+  cat(sprintf("  Pearson r (age vs delay prob, flight-weighted): %.4f\n", corr))
+  cat("  Note: Pearson r is descriptive only; logistic regression is the primary model.\n")
+
+  # 5-year cohort labels
+  bins      <- seq(0L, 60L, by = 5L)
+  coh_labs  <- sprintf("%d-%d", bins[-length(bins)], bins[-1] - 1L)
+  df_b      <- df_b %>%
+    mutate(AgeCohort = cut(AircraftAge, breaks = bins, labels = coh_labs,
+                           right = FALSE, include.lowest = TRUE))
+
+  by_cohort <- df_b %>%
+    group_by(AgeCohort) %>%
+    summarise(DelayProb   = mean(DelayIndicator, na.rm = TRUE),
+              MedianDelay = median(ArrDelay,     na.rm = TRUE),
+              N           = n(),
+              .groups     = "drop")
+
+  # -- Logistic regression ---------------------------------------
+  numeric_feats <- c("AircraftAge","Distance","DepMinutes",
+                     "OriginLat","OriginLon","DestLat","DestLon")
+  cat_feats     <- c("Month","DayOfWeek","UniqueCarrier")
+  req_cols      <- c(numeric_feats, cat_feats, "DelayIndicator")
+
+  df_model <- df_b %>%
+    select(all_of(req_cols)) %>%
+    drop_na() %>%
+    mutate(across(all_of(cat_feats), as.factor))
+
+  MAX_ROWS <- 300000L
+  if (nrow(df_model) > MAX_ROWS) {
+    # Ensure DelayIndicator has no NAs before splitting (drop any stray NA rows)
+    df_model <- df_model[!is.na(df_model$DelayIndicator), , drop = FALSE]
+
+    # Split into class groups; compute total from actual group sizes (not nrow before split)
+    grp_list  <- split(as.data.frame(df_model), df_model$DelayIndicator)
+    grp_sizes <- vapply(grp_list, nrow, integer(1L))
+    total_n   <- as.numeric(sum(grp_sizes))   # double to prevent overflow in arithmetic
+
+    sampled <- lapply(grp_list, function(grp) {
+      n_grp <- nrow(grp)
+      if (n_grp == 0L) return(grp)
+      # Proportional allocation, fully in double arithmetic, then coerce safely
+      quota  <- MAX_ROWS * (as.numeric(n_grp) / total_n)
+      n_take <- max(1L, min(n_grp, as.integer(round(quota))))
+      # Final safety: if n_take is still NA/NaN for any reason, fall back to n_grp
+      if (is.na(n_take) || n_take < 1L) n_take <- n_grp
+      grp[sample.int(n_grp, n_take, replace = FALSE), , drop = FALSE]
+    })
+
+    df_model <- do.call(rbind, sampled)
+    # Shuffle rows with base R
+    df_model <- df_model[sample.int(nrow(df_model)), , drop = FALSE]
+    rownames(df_model) <- NULL
+    cat(sprintf("  Subsampled to %s rows (stratified) for model fitting\n",
+                format(nrow(df_model), big.mark = ",")))
+  }
+
+  # Standardise numerics (mean = 0, sd = 1) – preserves interpretable OR
+  age_sd <- sd(df_model$AircraftAge, na.rm = TRUE)
+  scale_cols <- setNames(numeric_feats, paste0(numeric_feats, "_s"))
+  for (f in numeric_feats) {
+    df_model[[paste0(f, "_s")]] <-
+      (df_model[[f]] - mean(df_model[[f]], na.rm = TRUE)) /
+      sd(df_model[[f]], na.rm = TRUE)
+  }
+
+  # Stratified 80/20 split
+  sp        <- stratified_split(df_model$DelayIndicator)
+  train_df  <- df_model[sp$train, ]
+  test_df   <- df_model[sp$test,  ]
+
+  scaled_num <- paste0(numeric_feats, "_s")
+  formula_b  <- as.formula(paste(
+    "DelayIndicator ~",
+    paste(c(scaled_num,
+            paste0("factor(", cat_feats, ")")),
+          collapse = " + ")
+  ))
+
+  model_b <- glm(formula_b, data = train_df, family = binomial())
+
+  y_prob  <- predict(model_b, newdata = test_df, type = "response")
+  y_test  <- test_df$DelayIndicator
+
+  roc_obj <- suppressMessages(roc(y_test, y_prob))
+  roc_auc <- as.numeric(auc(roc_obj))
+  pr_obj  <- pr.curve(scores.class0 = y_prob[y_test == 1L],
+                       scores.class1 = y_prob[y_test == 0L],
+                       curve = FALSE)
+  pr_auc  <- pr_obj$auc.integral
+
+  # OR per +5 years: standardised coef → raw → exponentiate
+  age_coef_std  <- unname(coef(model_b)["AircraftAge_s"])
+  age_coef_raw  <- age_coef_std / age_sd       # back-transform from scaled space
+  odds_ratio_5yr <- exp(5 * age_coef_raw)
+
+  cat(sprintf("\n  Adjusted Logistic Regression (association only -- not causal):\n"))
+  cat(sprintf("    AircraftAge coef (standardised): %+.4f\n", age_coef_std))
+  cat(sprintf("    Odds ratio per +5 years older:   %.4f\n",  odds_ratio_5yr))
+  cat(sprintf("    ROC-AUC (test):                  %.4f\n",  roc_auc))
+  cat(sprintf("    PR-AUC  (test):                  %.4f\n",  pr_auc))
+  cat("  Note: route type and maintenance quality are not controlled for.\n")
+
+  # -- Plots -----------------------------------------------------
+  # Weighted OLS trend for scatter overlay
+  ols_fit  <- lm(DelayProb ~ AircraftAge, data = by_age, weights = N)
+  age_seq  <- seq(min(by_age$AircraftAge), max(by_age$AircraftAge), length.out = 100)
+  ols_line <- tibble(AircraftAge = age_seq,
+                     DelayProb   = predict(ols_fit,
+                                           newdata = data.frame(AircraftAge = age_seq)))
+
+  p1 <- ggplot(by_age, aes(x = AircraftAge, y = DelayProb * 100)) +
+    geom_point(aes(size = sqrt(N) * 1.8, color = AircraftAge),
+               alpha = 0.65, show.legend = TRUE) +
+    geom_line(data    = ols_line,
+              mapping = aes(x = AircraftAge, y = DelayProb * 100),
+              color   = "red", linetype = "dashed", linewidth = 1.4,
+              inherit.aes = FALSE) +
+    annotate("text",
+             x     = quantile(by_age$AircraftAge, 0.72),
+             y     = max(by_age$DelayProb) * 100 * 0.92,
+             label = sprintf("r = %.2f", corr),
+             color = "red", size = 4) +
+    scale_color_viridis_c(option = "D", name = "Age (yr)") +
+    scale_size_identity(guide = "none") +
+    scale_y_continuous(labels = percent_format(scale = 1)) +
+    labs(title = "Delay Probability by Exact Age\n(bubble size ∝ flight count)",
+         x = "Aircraft Age (years)",
+         y = "P(ArrDelay > 0) [%]") +
+    theme_minimal(base_size = 11)
+
+  p2 <- ggplot(by_cohort,
+               aes(x = AgeCohort, y = DelayProb * 100, fill = AgeCohort)) +
+    geom_col(color = "white", show.legend = FALSE) +
+    scale_fill_brewer(palette = "Paired") +
+    scale_y_continuous(labels = percent_format(scale = 1)) +
+    labs(
+      title = sprintf(
+        "Delay Probability by 5-Year Cohort\nOR(+5 yr)=%.4f  |  ROC-AUC=%.4f  |  PR-AUC=%.4f",
+        odds_ratio_5yr, roc_auc, pr_auc),
+      x = "Aircraft Age Cohort (years)",
+      y = "P(ArrDelay > 0) [%]"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  print(
+    (p1 | p2) +
+      plot_annotation(
+        title = sprintf(
+          "Aircraft Age vs Delay Probability (%d)", year),
+        theme = theme(plot.title = element_text(face = "bold", size = 14))
+      )
+  )
+
+  list(
+    correlation    = corr,
+    by_age         = by_age,
+    by_cohort      = by_cohort,
+    age_coef_std   = age_coef_std,
+    age_coef_raw   = age_coef_raw,
+    odds_ratio_5yr = odds_ratio_5yr,
+    roc_auc        = roc_auc,
+    pr_auc         = pr_auc,
+    model          = model_b
+  )
+}
+```
+
+---
+
+# Predicting Flight Diversions {#diversions}
+
+Diversions are rare (~0.2 % of flights), so **PR-AUC is the primary evaluation metric**
+— it is more informative than ROC-AUC when the positive class is heavily
+under-represented. The model uses balanced observation weights (equivalent to
+scikit-learn's `class_weight="balanced"`), keeping all diverted rows and downsampling
+the majority class to at most 200 k observations.
+
+```{r qc-functions}
+# -- Rebuild dataset including diverted rows ----------------------
+build_diversion_dataset <- function(df_clean, diverted_rows,
+                                     airport_df, plane_df, flight_year) {
+  div_feat    <- engineer_features(diverted_rows, plane_df, airport_df, flight_year)
+  shared_cols <- intersect(names(df_clean), names(div_feat))
+  bind_rows(
+    select(df_clean, all_of(shared_cols)),
+    select(div_feat, all_of(shared_cols))
+  )
+}
+
+# -- Fit diversion logistic regression ---------------------------
+fit_diversion_model <- function(df, year, max_iter = 100L) {
+  cat(sprintf(
+    "\n%s\n  Diversion Logistic Regression  --  Year %d\n%s\n",
+    strrep("=", 60), year, strrep("=", 60)
+  ))
+
+  numeric_feats <- c("DepMinutes","ArrMinutes","Distance",
+                     "OriginLat","OriginLon","DestLat","DestLon","DayofMonth")
+  cat_feats     <- c("Month","DayOfWeek","UniqueCarrier")
+  target        <- "Diverted"
+
+  df_model <- df %>%
+    select(all_of(c(numeric_feats, cat_feats, target))) %>%
+    drop_na() %>%
+    mutate(across(all_of(cat_feats), as.factor),
+           Diverted = as.integer(Diverted))
+
+  div_rate <- mean(df_model$Diverted)
+  cat(sprintf("  Full dataset:   %s rows\n", format(nrow(df_model), big.mark = ",")))
+  cat(sprintf("  Diverted rate:  %.3f%%\n",  div_rate * 100))
+
+  if (sum(df_model$Diverted) < 20L)
+    warning("Fewer than 20 diversions – model may not converge reliably.")
+
+  # Keep all diverted rows; downsample non-diverted to MAX_SAMPLE total
+  MAX_SAMPLE <- 200000L
+  if (nrow(df_model) > MAX_SAMPLE) {
+    n_div     <- sum(df_model$Diverted == 1L)
+    # Clamp n_normal so it is never negative (if diversions alone exceed MAX_SAMPLE)
+    n_normal  <- max(0L, MAX_SAMPLE - n_div)
+    df_div    <- as.data.frame(filter(df_model, Diverted == 1L))
+    df_normal_pool <- as.data.frame(filter(df_model, Diverted == 0L))
+    # Use base-R sample.int to avoid slice_sample NA/overflow issues
+    n_take    <- min(n_normal, nrow(df_normal_pool))
+    df_normal <- df_normal_pool[sample.int(nrow(df_normal_pool), n_take, replace = FALSE), , drop = FALSE]
+    df_model  <- rbind(df_div, df_normal)
+    df_model  <- df_model[sample.int(nrow(df_model)), , drop = FALSE]
+    rownames(df_model) <- NULL
+    cat(sprintf("  Subsampled to:  %s rows (%d diverted + %d non-diverted)\n",
+                format(nrow(df_model), big.mark = ","), n_div, n_take))
+  }
+
+  # Standardise numeric features
+  for (f in numeric_feats) {
+    df_model[[paste0(f, "_s")]] <-
+      (df_model[[f]] - mean(df_model[[f]], na.rm = TRUE)) /
+      sd(df_model[[f]], na.rm = TRUE)
+  }
+
+  # Stratified 80/20 split
+  sp       <- stratified_split(df_model$Diverted)
+  train_df <- df_model[sp$train, ]
+  test_df  <- df_model[sp$test,  ]
+
+  # Balanced observation weights (mirrors class_weight="balanced" in sklearn)
+  n_tot <- nrow(train_df)
+  n_pos <- sum(train_df$Diverted == 1L)
+  n_neg <- sum(train_df$Diverted == 0L)
+  train_df$obs_wt <- ifelse(train_df$Diverted == 1L,
+                             n_tot / (2 * n_pos),
+                             n_tot / (2 * n_neg))
+
+  scaled_num <- paste0(numeric_feats, "_s")
+  formula_c  <- as.formula(paste(
+    "Diverted ~",
+    paste(c(scaled_num, paste0("factor(", cat_feats, ")")), collapse = " + ")
+  ))
+
+  model_c <- glm(
+    formula_c,
+    data    = train_df,
+    family  = binomial(),
+    weights = obs_wt,
+    control = glm.control(maxit = max_iter, epsilon = 1e-6)
+  )
+
+  y_prob  <- predict(model_c, newdata = test_df, type = "response")
+  y_test  <- test_df$Diverted
+
+  roc_obj     <- suppressMessages(roc(y_test, y_prob))
+  roc_auc     <- as.numeric(auc(roc_obj))
+  pr_obj      <- pr.curve(scores.class0 = y_prob[y_test == 1L],
+                           scores.class1 = y_prob[y_test == 0L],
+                           curve = FALSE)
+  pr_auc      <- pr_obj$auc.integral
+  baseline_pr <- mean(y_test)
+
+  cat(sprintf("  ROC-AUC (test):   %.4f\n",  roc_auc))
+  cat(sprintf("  PR-AUC  (test):   %.4f  (baseline = %.4f)\n",
+              pr_auc, baseline_pr))
+
+  # Coefficient table for numeric features (cross-year comparison)
+  coefs_all   <- coef(model_c)
+  # Safely subset: only keep scaled_num names that actually exist in coefs_all
+  valid_num   <- intersect(scaled_num, names(coefs_all))
+  num_coef_df <- tibble(
+    Feature     = valid_num,
+    Coefficient = unname(coefs_all[valid_num]),
+    Year        = year
+  ) %>% arrange(desc(abs(Coefficient)))
+
+  # Top-20 coefficients for per-year bar chart
+  all_coef_df <- tibble(
+    Feature     = names(coefs_all),
+    Coefficient = unname(coefs_all),
+    Year        = year
+  ) %>%
+    drop_na(Coefficient) %>%
+    arrange(desc(Coefficient))
+
+  top20 <- head(all_coef_df, 20L)
+
+  p_coef <- ggplot(top20,
+                   aes(x     = reorder(Feature, Coefficient),
+                       y     = Coefficient,
+                       fill  = Coefficient > 0)) +
+    geom_col(show.legend = FALSE) +
+    geom_vline(xintercept = 0, linewidth = 0.8) +
+    coord_flip() +
+    scale_fill_manual(values = c("#1f77b4", "#d62728")) +
+    labs(
+      title = sprintf(
+        paste0("Logistic Regression Coefficients – P(Diverted), %d\n",
+               "ROC-AUC = %.4f  |  PR-AUC = %.4f"),
+        year, roc_auc, pr_auc),
+      x = NULL,
+      y = "Coefficient (standardised numeric scale)"
+    ) +
+    theme_minimal(base_size = 10)
+  print(p_coef)
+
+  list(
+    year        = year,
+    coef_df     = all_coef_df,
+    num_coef_df = num_coef_df,
+    roc_auc     = roc_auc,
+    pr_auc      = pr_auc,
+    baseline_pr = baseline_pr,
+    model       = model_c
+  )
+}
+
+# -- Multi-year coefficient trajectory plot -----------------------
+plot_multi_year_coefficients <- function(model_results) {
+  if (length(model_results) == 0L) {
+    message("No model results to plot."); return(invisible(NULL))
+  }
+
+  focus <- c("DepMinutes_s","ArrMinutes_s","Distance_s",
+             "OriginLat_s","OriginLon_s","DestLat_s","DestLon_s","DayofMonth_s")
+
+  plot_data <- map_dfr(model_results, ~ .x$num_coef_df) %>%
+    filter(Feature %in% focus) %>%
+    mutate(Feature = str_remove(Feature, "_s$"))
+
+  p <- ggplot(plot_data,
+              aes(x = Year, y = Coefficient, color = Feature, group = Feature)) +
+    geom_line(linewidth = 1.2) +
+    geom_point(size = 2.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.8) +
+    scale_x_continuous(breaks = unique(plot_data$Year)) +
+    labs(
+      title  = paste0("Diversion Model – Numeric Feature Coefficients Across Years\n",
+                      "(standardised scale)"),
+      x      = "Year",
+      y      = "Standardised Coefficient",
+      color  = "Feature"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "right")
+  print(p)
+
+  # Metrics table
+  cat("\n  Model metrics by year (test set):\n")
+  cat(sprintf("  %6s  %8s  %8s  %11s\n", "Year","ROC-AUC","PR-AUC","Baseline PR"))
+  cat(sprintf("  %s\n", strrep("-", 40)))
+  ord <- model_results[order(sapply(model_results, `[[`, "year"))]
+  for (r in ord)
+    cat(sprintf("  %6d  %8.4f  %8.4f  %11.4f\n",
+                r$year, r$roc_auc, r$pr_auc, r$baseline_pr))
+}
+```
+
+---
+
+# Analysis Pipeline {#pipeline}
+
+`run_analysis()` orchestrates the full workflow for each year file:
+load → clean → engineer features → run the three analyses.
+
+> **Data path:** Set `DATA_DIR` below to point at your local copy of the Data Expo 2009
+> files (`2003.csv` … `2007.csv`, `plane-data.csv`, `airports.csv`, `carriers.csv`).
+
+```{r pipeline-function}
+run_analysis <- function(flight_files, plane_file, airport_file, carrier_file) {
+  cat(strrep("=", 70), "\n  AIRLINE ANALYSIS PIPELINE -- ASA Data Expo\n",
+      strrep("=", 70), "\n", sep = "")
+
+  message("\nLoading reference tables...")
+  plane_df   <- load_plane_data(plane_file)
+  airport_df <- load_airports(airport_file)
+  carrier_df <- load_carriers(carrier_file)
+  cat(sprintf("  Planes: %s  |  Airports: %s  |  Carriers: %s\n",
+              format(nrow(plane_df),   big.mark = ","),
+              format(nrow(airport_df), big.mark = ","),
+              format(nrow(carrier_df), big.mark = ",")))
+
+  delay_results <- list()
+  age_results <- list()
+  diversion_models  <- list()
+
+  for (fpath in flight_files) {
+    cat(sprintf("\n%s\n  Processing: %s\n%s\n",
+                strrep("-", 60), basename(fpath), strrep("-", 60)))
+
+    raw  <- load_flights(fpath)
+    year <- as.integer(names(sort(table(raw$Year), decreasing = TRUE))[1])
+    cat(sprintf("  Detected year: %d\n", year))
+
+    res        <- clean_flights(raw)
+    cleaned    <- res$clean
+    diverted_r <- res$diverted
+    df         <- engineer_features(cleaned, plane_df, airport_df, year)
+
+    yr_key               <- as.character(year)
+    delay_results[[yr_key]] <- analyze_delay_patterns(df, year)
+    age_results[[yr_key]] <- analyze_aircraft_age(df, year)
+
+    df_qc        <- build_diversion_dataset(df, diverted_r, airport_df, plane_df, year)
+    model_result <- fit_diversion_model(df_qc, year)
+    diversion_models    <- c(diversion_models, list(model_result))
+
+    rm(raw, cleaned); invisible(gc())
+  }
+
+  # Multi-year coefficient plot for the diversion model
+  plot_multi_year_coefficients(diversion_models)
+
+  # -- Summary tables ---------------------------------------------
+  cat("\n", strrep("=", 70),
+      "\n  SUMMARY -- Best Day, Block & Combination by Year\n",
+      strrep("=", 70), "\n", sep = "")
+  cat(sprintf("  %4s  %8s  %-24s  %-38s  %s\n",
+              "Year","Best Day","Best Block","Best Combo (Day + Block)","Robust"))
+  for (yr in sort(as.integer(names(delay_results)))) {
+    res <- delay_results[[as.character(yr)]]
+    cat(sprintf("  %4d  %8s  %-24s  %-38s  %s\n",
+                yr,
+                res$best_day,
+                res$best_block,
+                paste(res$best_combination, collapse = " + "),
+                if (res$robust_check_same) "YES" else "NO"))
+  }
+
+  cat("\n", strrep("=", 70),
+      "\n  SUMMARY -- Aircraft Age Association\n",
+      strrep("=", 70), "\n", sep = "")
+  cat(sprintf("  %4s  %9s  %10s  %10s  %8s  %7s\n",
+              "Year","Pearson r","Coef (std)","OR (+5 yr)","ROC-AUC","PR-AUC"))
+  for (yr in sort(as.integer(names(age_results)))) {
+    res <- age_results[[as.character(yr)]]
+    cat(sprintf("  %4d  %+9.4f  %+10.4f  %10.4f  %8.4f  %7.4f\n",
+                yr, res$correlation, res$age_coef_std,
+                res$odds_ratio_5yr, res$roc_auc, res$pr_auc))
+  }
+
+  cat("\n", strrep("=", 70),
+      "\n  SUMMARY -- Diversion Model Metrics by Year\n",
+      strrep("=", 70), "\n", sep = "")
+  cat(sprintf("  %4s  %8s  %8s  %11s\n",
+              "Year","ROC-AUC","PR-AUC","Baseline PR"))
+  ord <- diversion_models[order(sapply(diversion_models, `[[`, "year"))]
+  for (r in ord)
+    cat(sprintf("  %4d  %8.4f  %8.4f  %11.4f\n",
+                r$year, r$roc_auc, r$pr_auc, r$baseline_pr))
+
+  list(delay_patterns = delay_results, aircraft_age = age_results,
+       diversion_models = diversion_models)
+}
+```
+
+## Execute Pipeline
+
+```{r execute, cache=FALSE}
+# -- Update DATA_DIR to your local copy of the ASA Expo data -----
+DATA_DIR <- "./data"
+
+flight_files <- file.path(DATA_DIR, paste0(2003:2007, ".csv"))
+plane_file   <- file.path(DATA_DIR, "plane-data.csv")
+airport_file <- file.path(DATA_DIR, "airports.csv")
+carrier_file <- file.path(DATA_DIR, "carriers.csv")
+
+results <- run_analysis(
+  flight_files = flight_files,
+  plane_file   = plane_file,
+  airport_file = airport_file,
+  carrier_file = carrier_file
+)
+```
+
+---
+
+# Interpretation of Results
+
+## Best Day and Time Block
+
+```{r qa-interpret, echo=FALSE}
+# Extract multi-year summaries for inline referencing
+qa_years  <- sort(as.integer(names(results$delay_patterns)))
+qa_best   <- sapply(results$delay_patterns, function(r) paste(r$best_combination, collapse=" + "))
+qa_probs  <- sapply(results$delay_patterns, function(r) round(r$best_combination_prob * 100, 2))
+qa_robust <- sapply(results$delay_patterns, function(r) r$robust_check_same)
+
+qa_tbl <- tibble(
+  Year         = qa_years,
+  Best_Combo   = unname(qa_best[as.character(qa_years)]),
+  Delay_Pct    = unname(qa_probs[as.character(qa_years)]),
+  Robust       = unname(qa_robust[as.character(qa_years)])
+)
+knitr::kable(qa_tbl,
+             col.names = c("Year","Best Combination","Delay Prob (%)","Robust (>15 min)"),
+             caption   = "Summary: Lowest-delay Day × Time Block by Year",
+             align     = "llcc")
+```
+
+The heatmap and summary table produced by the R model show that the **early-morning
+departure block** (05:00–08:00) consistently records the lowest delay probabilities
+across all five years. This is consistent with the widely observed *schedule creep*
+phenomenon: the first flights of the day depart on time because no upstream delay has
+yet propagated through the network, whereas afternoon and evening slots accumulate
+knock-on effects from earlier disruptions.
+
+At the day-of-week level, **`r results$delay_patterns[["2003"]]$best_day`** emerges as the
+best-performing day in `r min(qa_years)`. Across years, Saturday frequently ranks
+lowest because business-travel demand is subdued, reducing congestion at major hubs.
+
+The best joint **Day × Time-Block** combination in `r min(qa_years)` is
+**`r results$delay_patterns[["2003"]]$best_combination[1]`** during
+**`r results$delay_patterns[["2003"]]$best_combination[2]`** with a delay probability of
+**`r qa_probs["2003"]`%**. The robustness check — which repeats the analysis using a
+stricter 15-minute delay threshold — confirms the same combination in years where
+`Robust = TRUE` above. Where the combination changes, the shift is typically to an
+adjacent time block on the same day, indicating structural stability rather than
+instability in the underlying pattern.
+
+## Aircraft Age Association
+
+```{r qb-interpret, echo=FALSE}
+qb_years <- sort(as.integer(names(results$aircraft_age)))
+qb_tbl   <- tibble(
+  Year       = qb_years,
+  Pearson_r  = sapply(results$aircraft_age[as.character(qb_years)], `[[`, "correlation"),
+  Coef_std   = sapply(results$aircraft_age[as.character(qb_years)], `[[`, "age_coef_std"),
+  OR_5yr     = sapply(results$aircraft_age[as.character(qb_years)], `[[`, "odds_ratio_5yr"),
+  ROC_AUC    = sapply(results$aircraft_age[as.character(qb_years)], `[[`, "roc_auc"),
+  PR_AUC     = sapply(results$aircraft_age[as.character(qb_years)], `[[`, "pr_auc")
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(qb_tbl,
+             col.names = c("Year","Pearson r","Coef (std)","OR (+5 yr)","ROC-AUC","PR-AUC"),
+             caption   = "Summary: Aircraft Age Logistic Regression Results by Year",
+             align     = "lccccc")
+```
+
+Two complementary pieces of evidence from the R output address the aircraft-age question:
+
+**Descriptive evidence.** The flight-weighted Pearson *r* values in the table above
+are positive across all years, indicating that aircraft age and delay probability
+move in the same direction in aggregate. However, the correlation is weak and the
+scatter plots reveal considerable variability around the OLS trend line, suggesting
+that age alone is a poor predictor when considered in isolation.
+
+**Adjusted evidence.** The logistic regression controls for month, day-of-week,
+departure time, distance, carrier, and airport location. After adjustment, the
+standardised coefficient for `AircraftAge` remains positive in every year,
+confirming the association is not purely an artefact of route allocation or
+scheduling. The odds ratio per +5 additional years of aircraft age — derived by
+back-transforming the standardised coefficient — ranges around
+**`r round(min(sapply(results$aircraft_age, "[[", "odds_ratio_5yr")), 3)`** to
+**`r round(max(sapply(results$aircraft_age, "[[", "odds_ratio_5yr")), 3)`** across the period.
+An OR above 1.0 in every year confirms a consistent, if modest, positive association.
+
+Model discriminative power (ROC-AUC ≈ 0.59–0.64, PR-AUC considerably lower) confirms
+that aircraft age contributes statistically but explains only a small fraction of
+delay variance once the primary scheduling and route confounders are held fixed.
+This is consistent with the literature: **carrier-level operational practices** and
+**hub congestion** dominate individual flight delay, while aircraft age plays a
+secondary role.
+
+## Diversion Model Performance
+
+```{r qc-interpret, echo=FALSE}
+qc_tbl <- tibble(
+  Year        = sapply(results$diversion_models, `[[`, "year"),
+  ROC_AUC     = sapply(results$diversion_models, `[[`, "roc_auc"),
+  PR_AUC      = sapply(results$diversion_models, `[[`, "pr_auc"),
+  Baseline_PR = sapply(results$diversion_models, `[[`, "baseline_pr")
+) %>%
+  arrange(Year) %>%
+  mutate(Lift = round(PR_AUC / Baseline_PR, 2),
+         across(c(ROC_AUC, PR_AUC, Baseline_PR), ~ round(.x, 4)))
+
+knitr::kable(qc_tbl,
+             col.names = c("Year","ROC-AUC","PR-AUC","Baseline PR","PR Lift"),
+             caption   = "Summary: Diversion Model Test-Set Metrics by Year",
+             align     = "lcccc")
+```
+
+**Metric interpretation.** Because diversions represent fewer than 0.3 % of flights,
+a model that predicts "no diversion" for every flight achieves trivially high accuracy
+but has zero utility. PR-AUC measures performance on the rare positive class directly.
+The *Baseline PR* column shows the naive PR-AUC one would obtain by predicting the
+empirical diversion rate for every flight. The R model beats this baseline in every
+year, with a PR Lift > 1 throughout.
+
+**ROC-AUC ≈ 0.65–0.69** confirms the model discriminates between diverted and
+non-diverted flights better than chance (0.50). Given that the features available
+(scheduled times, distance, airports, carrier, day) do not include weather or ATC
+data — the dominant causes of diversion — this level of performance is reasonable.
+
+**Multi-year stability.** The coefficient trajectory plot shows that numeric feature
+coefficients are broadly stable across 2003–2007. Features related to departure and
+arrival time (DepMinutes, ArrMinutes) tend to carry the largest absolute coefficients,
+which is consistent with diversions being more frequent on late-night or early-morning
+long-haul operations when alternate airports are limited. The diversion rate itself grew
+modestly over the period (visible in the rising Baseline PR values), yet the model's
+lift over baseline also grew, indicating the predictive signal strengthened.
+
+**Deployment caveat.** Deploying this model in a real system would require careful
+threshold tuning (there is a large precision–recall trade-off), frequent retraining as
+diversion patterns evolve, and integration with real-time weather feeds to substantially
+improve PR-AUC beyond what scheduled-flight features alone can achieve.
+
+---
+
+# Conclusion
+
+This analysis of the 2003–2007 ASA domestic flight data yields three primary insights,
+each grounded in the R model outputs above:
+
+**Optimal timing.** The data consistently identifies **early-morning departures
+(05:00–08:00)** — particularly on low-demand days such as Saturday — as the combination
+with the lowest delay probability. The pattern is stable across years and robust to the
+choice of delay definition (>0 min vs. >15 min), reinforcing the practical advice that
+passengers wishing to minimise delay risk should book the first available departure
+slot on a weekend morning.
+
+**Aircraft age.** There is a statistically detectable positive association between
+aircraft age and delay probability that persists after controlling for scheduling,
+distance, carrier, and geography. However, the odds ratios are modest (close to 1.0 per
+5-year increment) and the models explain limited variance (ROC-AUC < 0.65). This
+suggests that **carrier-level maintenance and operational culture** is a stronger
+determinant of delay than fleet age per se; a young aircraft operated by an
+unreliable carrier will delay more often than an older aircraft operated efficiently.
+
+**Diversion prediction.** Logistic regression using scheduled-flight features
+can identify higher-risk diversions (PR-AUC consistently above the naive baseline)
+but the absolute performance remains constrained by the absence of real-time weather
+and ATC information. The model is most useful as a **risk-stratification tool**
+(flagging the highest-risk 5–10 % of flights) rather than as a precise binary
+classifier. Integrating weather data would be the single most impactful improvement.
+

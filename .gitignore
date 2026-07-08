@@ -1,0 +1,22 @@
+# Flight data — too large for git, see README "Data" section
+data/
+
+# Python
+.ipynb_checkpoints/
+__pycache__/
+.venv/
+venv/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Rendered output
+*.html
+*.pdf
+
+# OS
+Thumbs.db
+.DS_Store
