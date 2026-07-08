@@ -1,0 +1,4 @@
+# Testing and CI, on top of requirements.txt
+pytest>=8.0
+nbconvert>=7.16
+ipykernel>=6.29

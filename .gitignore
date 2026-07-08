@@ -1,5 +1,8 @@
 # Flight data, too large for git, see README "Data" section
-data/
+# (data/sample/ is a small synthetic dataset and IS committed, see scripts/generate_sample_data.py)
+data/*
+!data/sample/
+!data/sample/**
 
 # Python
 .ipynb_checkpoints/
