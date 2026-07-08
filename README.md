@@ -1,24 +1,24 @@
 # MCMC from Scratch & US Flight Delays at Scale
 
-Two statistical computing projects, each implemented twice — once in **Python** and once in **R** — to show the same methodology working across both ecosystems:
+Two statistical computing projects, each implemented twice (once in **Python** and once in **R**), to show the same methodology working across both ecosystems:
 
-1. **Metropolis–Hastings MCMC** — a random walk Metropolis sampler built from scratch, with Gelman–Rubin ($\hat{R}$) convergence diagnostics.
-2. **US flight delay analysis** — a memory-efficient pipeline over **~35 million flight records** (2003–2007) answering when to fly, whether aircraft age matters, and how well rare flight diversions can be predicted with logistic regression.
+1. **Metropolis–Hastings MCMC**: a random walk Metropolis sampler built from scratch, with Gelman–Rubin ($\hat{R}$) convergence diagnostics.
+2. **US flight delay analysis**: a memory-efficient pipeline over **~35 million flight records** (2003–2007) answering when to fly, whether aircraft age matters, and how well rare flight diversions can be predicted with logistic regression.
 
 *This project began as university coursework and has since been revised and extended as a personal portfolio piece.*
 
 ---
 
-## Part 1 — Metropolis–Hastings MCMC
+## Part 1: Metropolis–Hastings MCMC
 
-**The problem.** You often need samples from a distribution you can't sample directly — you only know a function proportional to its density. MCMC solves this by constructing a Markov chain whose long-run distribution is the target. This project implements the simplest such algorithm, **random walk Metropolis**, and uses the Laplace distribution $f(x) = \frac{1}{2}e^{-|x|}$ as a target where the true answer is known, so the sampler can be validated exactly.
+**The problem.** You often need samples from a distribution you can't sample directly; you only know a function proportional to its density. MCMC solves this by constructing a Markov chain whose long-run distribution is the target. This project implements the simplest such algorithm, **random walk Metropolis**, and uses the Laplace distribution $f(x) = \frac{1}{2}e^{-|x|}$ as a target where the true answer is known, so the sampler can be validated exactly.
 
-**Methodology in plain language.** From the current position, propose a small random step. If the proposed point has higher density, move there; if lower, move with probability equal to the density ratio. Repeat thousands of times and the visited points behave like samples from the target. The catch: results are only valid if the chain has *converged*, and this is where the **Gelman–Rubin diagnostic** comes in — run several chains from dispersed starting points and compare within-chain to between-chain variance ($\hat{R} \approx 1$ means the chains agree; $\hat{R} \gg 1$ means they haven't mixed).
+**Methodology in plain language.** From the current position, propose a small random step. If the proposed point has higher density, move there; if lower, move with probability equal to the density ratio. Repeat thousands of times and the visited points behave like samples from the target. The catch: results are only valid if the chain has *converged*, and this is where the **Gelman–Rubin diagnostic** comes in: run several chains from dispersed starting points and compare within-chain to between-chain variance ($\hat{R} \approx 1$ means the chains agree; $\hat{R} \gg 1$ means they haven't mixed).
 
 **Key findings.**
 
 - With proposal scale $s = 1$, the sampler recovers the Laplace distribution almost exactly: MC mean ≈ 0.02 (true 0), MC std ≈ 1.49 (true $\sqrt{2} \approx 1.41$), acceptance rate ≈ 0.70.
-- With $s = 0.001$ the chains barely move from their starting points and $\hat{R} \approx 227$ — a textbook illustration of non-convergence.
+- With $s = 0.001$ the chains barely move from their starting points and $\hat{R} \approx 227$, a textbook illustration of non-convergence.
 - Sweeping $s$ across a log grid shows convergence ($\hat{R} < 1.05$) is reached once $s \gtrsim 0.1$, i.e. once the proposal scale approaches the same order as the target's standard deviation.
 
 | Samples vs. true density | $\hat{R}$ vs. proposal scale |
@@ -29,7 +29,7 @@ Two statistical computing projects, each implemented twice — once in **Python*
 
 ---
 
-## Part 2 — US Flight Delay Analysis (2003–2007)
+## Part 2: US Flight Delay Analysis (2003–2007)
 
 **The problem.** Using five years of US domestic flight records, answer three practical questions:
 
@@ -41,9 +41,9 @@ Two statistical computing projects, each implemented twice — once in **Python*
 
 **Key findings.**
 
-- **Fly early, fly on weekends.** The early-morning block (05:00–08:00) has the lowest delay probability in every year, and the Sunday + early-morning combination is the overall winner (delay probability 25% in 2003 rising to 32% in 2007). Delays compound through the day — a knock-on effect of the hub-and-spoke system.
+- **Fly early, fly on weekends.** The early-morning block (05:00–08:00) has the lowest delay probability in every year, and the Sunday + early-morning combination is the overall winner (delay probability 25% in 2003 rising to 32% in 2007). Delays compound through the day, a knock-on effect of the hub-and-spoke system.
 - **Aircraft age matters, but barely.** After adjustment, the odds ratio per +5 years of age is 1.01–1.04. Carrier operational performance dominates fleet age.
-- **Diversions are partially predictable.** The model beats the naive baseline in every year (e.g. PR-AUC 0.159 vs 0.086 baseline in 2007; ROC-AUC ≈ 0.65–0.68) using schedule features alone — useful for risk-flagging, though weather data would be needed for deployable accuracy.
+- **Diversions are partially predictable.** The model beats the naive baseline in every year (e.g. PR-AUC 0.159 vs 0.086 baseline in 2007; ROC-AUC ≈ 0.65–0.68) using schedule features alone, useful for risk-flagging, though weather data would be needed for deployable accuracy.
 
 ![Delay probability heatmap by day and time block, 2007](images/flight_delay_heatmap_2007.png)
 
@@ -57,7 +57,7 @@ Two statistical computing projects, each implemented twice — once in **Python*
 
 - **Python:** NumPy, SciPy, pandas, scikit-learn, Matplotlib, seaborn (Jupyter notebooks)
 - **R:** data.table, tidyverse, ggplot2, patchwork, pROC, PRROC (R Markdown)
-- **Data:** Harvard Dataverse — Data Expo 2009: Airline On-Time Data
+- **Data:** Harvard Dataverse, Data Expo 2009: Airline On-Time Data
 
 ## Repository structure
 
@@ -68,7 +68,7 @@ Two statistical computing projects, each implemented twice — once in **Python*
 ├── flight_delay_logistic_regression.Rmd  # Part 2, R implementation
 ├── images/                               # Output plots embedded above
 ├── requirements.txt                      # Python dependencies
-└── data/                                 # Flight data (not committed — see below)
+└── data/                                 # Flight data (not committed, see below)
 ```
 
 ## Data

@@ -33,7 +33,7 @@ knitr::opts_chunk$set(
 
 # Overview
 
-**Data source:** [Data Expo 2009: Airline On-Time Data](https://doi.org/10.7910/DVN/HG7NV7) (Harvard Dataverse), domestic US flights 2003–2007 — roughly 35 million records.
+**Data source:** [Data Expo 2009: Airline On-Time Data](https://doi.org/10.7910/DVN/HG7NV7) (Harvard Dataverse), domestic US flights 2003–2007, roughly 35 million records.
 
 *This project began as university coursework and has since been revised and extended as a personal portfolio piece.*
 
@@ -137,7 +137,7 @@ load_plane_data <- function(filepath) {
   setnames(dt, tolower(trimws(names(dt))))   # lowercase + strip any whitespace/BOM
 
   # If fread still misread the header (first row became col names), the real
-  # column names will be in row 1 — detect and recover automatically.
+  # column names will be in row 1; detect and recover automatically.
   if (!"tailnum" %in% names(dt)) {
     # Try reading with base R, which is more robust with unusual CSV headers
     raw <- read.csv(filepath, stringsAsFactors = FALSE, check.names = FALSE,
@@ -287,9 +287,9 @@ engineer_features <- function(df, plane_df, airport_df, flight_year) {
 
 ---
 
-# Best Time to Fly — Delay Patterns by Day and Time Block {#best-time}
+# Best Time to Fly: Delay Patterns by Day and Time Block {#best-time}
 
-For each year, delay probability — P(ArrDelay > 0) — is computed across all
+For each year, delay probability (P(ArrDelay > 0)) is computed across all
 42 day × time-block cells to identify the joint minimum.
 A robustness check repeats the analysis under a stricter definition (ArrDelay > 15 min).
 
@@ -679,8 +679,8 @@ analyze_aircraft_age <- function(df, year) {
 
 # Predicting Flight Diversions {#diversions}
 
-Diversions are rare (~0.2 % of flights), so **PR-AUC is the primary evaluation metric**
-— it is more informative than ROC-AUC when the positive class is heavily
+Diversions are rare (~0.2 % of flights), so **PR-AUC is the primary evaluation metric**,
+as it is more informative than ROC-AUC when the positive class is heavily
 under-represented. The model uses balanced observation weights (equivalent to
 scikit-learn's `class_weight="balanced"`), keeping all diverted rows and downsampling
 the majority class to at most 200 k observations.
@@ -1037,8 +1037,8 @@ lowest because business-travel demand is subdued, reducing congestion at major h
 The best joint **Day × Time-Block** combination in `r min(qa_years)` is
 **`r results$delay_patterns[["2003"]]$best_combination[1]`** during
 **`r results$delay_patterns[["2003"]]$best_combination[2]`** with a delay probability of
-**`r qa_probs["2003"]`%**. The robustness check — which repeats the analysis using a
-stricter 15-minute delay threshold — confirms the same combination in years where
+**`r qa_probs["2003"]`%**. The robustness check, which repeats the analysis using a
+stricter 15-minute delay threshold, confirms the same combination in years where
 `Robust = TRUE` above. Where the combination changes, the shift is typically to an
 adjacent time block on the same day, indicating structural stability rather than
 instability in the underlying pattern.
@@ -1075,8 +1075,8 @@ that age alone is a poor predictor when considered in isolation.
 departure time, distance, carrier, and airport location. After adjustment, the
 standardised coefficient for `AircraftAge` remains positive in every year,
 confirming the association is not purely an artefact of route allocation or
-scheduling. The odds ratio per +5 additional years of aircraft age — derived by
-back-transforming the standardised coefficient — ranges around
+scheduling. The odds ratio per +5 additional years of aircraft age (derived by
+back-transforming the standardised coefficient) ranges around
 **`r round(min(sapply(results$aircraft_age, "[[", "odds_ratio_5yr")), 3)`** to
 **`r round(max(sapply(results$aircraft_age, "[[", "odds_ratio_5yr")), 3)`** across the period.
 An OR above 1.0 in every year confirms a consistent, if modest, positive association.
@@ -1117,7 +1117,7 @@ year, with a PR Lift > 1 throughout.
 **ROC-AUC ≈ 0.65–0.69** confirms the model discriminates between diverted and
 non-diverted flights better than chance (0.50). Given that the features available
 (scheduled times, distance, airports, carrier, day) do not include weather or ATC
-data — the dominant causes of diversion — this level of performance is reasonable.
+data, the dominant causes of diversion, this level of performance is reasonable.
 
 **Multi-year stability.** The coefficient trajectory plot shows that numeric feature
 coefficients are broadly stable across 2003–2007. Features related to departure and
@@ -1140,7 +1140,7 @@ This analysis of the 2003–2007 ASA domestic flight data yields three primary i
 each grounded in the R model outputs above:
 
 **Optimal timing.** The data consistently identifies **early-morning departures
-(05:00–08:00)** — particularly on low-demand days such as Saturday — as the combination
+(05:00–08:00)**, particularly on low-demand days such as Saturday, as the combination
 with the lowest delay probability. The pattern is stable across years and robust to the
 choice of delay definition (>0 min vs. >15 min), reinforcing the practical advice that
 passengers wishing to minimise delay risk should book the first available departure

@@ -44,7 +44,7 @@ set.seed(42)
 
 ---
 
-Markov Chain Monte Carlo lets you draw samples from a distribution when direct sampling is impractical — all you need is a function proportional to its density. This document implements the **random walk Metropolis** algorithm (the simplest member of the Metropolis–Hastings family) from scratch in base R, uses it to sample the Laplace distribution, and then applies the **Gelman–Rubin diagnostic** $\hat{R}$ to answer the question every MCMC practitioner faces: *how do you know your chains have actually converged?*
+Markov Chain Monte Carlo lets you draw samples from a distribution when direct sampling is impractical; all you need is a function proportional to its density. This document implements the **random walk Metropolis** algorithm (the simplest member of the Metropolis–Hastings family) from scratch in base R, uses it to sample the Laplace distribution, and then applies the **Gelman–Rubin diagnostic** $\hat{R}$ to answer the question every MCMC practitioner faces: *how do you know your chains have actually converged?*
 
 *This project began as university coursework and has since been revised and extended as a personal portfolio piece. A parallel Python implementation lives in `mcmc_metropolis_hastings.ipynb`.*
 
@@ -128,7 +128,7 @@ x_grid <- seq(-8, 8, length.out = 500)
 kde_fit <- density(samples_a, bw = "nrd0", n = 512)
 
 plot_title <- sprintf(
-  "Random Walk Metropolis — Laplace Target\nN = %s,  s = %.1f,  MC mean ≈ %.4f,  MC std ≈ %.4f,  accept rate ≈ %.2f",
+  "Random Walk Metropolis: Laplace Target\nN = %s,  s = %.1f,  MC mean ≈ %.4f,  MC std ≈ %.4f,  accept rate ≈ %.2f",
   format(N_a, big.mark = ","), s_a, mc_mean, mc_std, accept_rate
 )
 
@@ -194,7 +194,7 @@ rhat_b <- compute_rhat(chains_b)
 
 cat(sprintf("R-hat  (N=%d, s=%.3f, J=%d): %.4f\n", N_b, s_b, J, rhat_b))
 cat(sprintf("Converged (R-hat < 1.05)?  %s\n",
-            ifelse(rhat_b < 1.05, "Yes", "No — poor mixing detected")))
+            ifelse(rhat_b < 1.05, "Yes", "No, poor mixing detected")))
 ```
 
 With $s = 0.001$, each proposal step is $\sim 10^{-3}$, so chains started at $\{-5, -1, 1, 5\}$ barely move over 2,000 iterations. Between-chain variance dominates, giving $\hat{R} \gg 1.05$.
@@ -219,8 +219,8 @@ ggplot(chain_df, aes(x = iteration, y = value, colour = chain)) +
   facet_wrap(~ chain, ncol = 1, scales = "free_y") +
   scale_colour_manual(values = c("steelblue", "darkorange", "seagreen", "#DC143C")) +
   labs(
-    title    = sprintf("Four chains — N = %d, s = %.3f, J = %d", N_b, s_b, J),
-    subtitle = sprintf("R-hat = %.4f — chains stuck near starting values", rhat_b),
+    title    = sprintf("Four chains: N = %d, s = %.3f, J = %d", N_b, s_b, J),
+    subtitle = sprintf("R-hat = %.4f, chains stuck near starting values", rhat_b),
     x        = "Iteration",
     y        = expression(x[i]),
     colour   = NULL
@@ -232,7 +232,7 @@ ggplot(chain_df, aes(x = iteration, y = value, colour = chain)) +
   )
 ```
 
-## $\hat{R}$ vs $s$ — log-spaced grid $[0.001,\, 1]$
+## $\hat{R}$ vs $s$: log-spaced grid $[0.001,\, 1]$
 
 Now we sweep across a range of $s$ values to see at what point the chains start mixing well.
 
@@ -309,7 +309,7 @@ ggplot(rhat_df, aes(x = s, y = rhat)) +
 
 The Random Walk Metropolis sampler targets the Laplace(0, 1) distribution well when the proposal scale is chosen appropriately:
 
-- For **$s = 1$**: the acceptance rate is $\approx `r round(accept_rate, 2)`$, the MC mean is $\approx `r round(mc_mean, 4)`$, and the MC standard deviation is $\approx `r round(mc_std, 4)`$ — both very close to the theoretical values of 0 and $\sqrt{2} \approx 1.4142$.
+- For **$s = 1$**: the acceptance rate is $\approx `r round(accept_rate, 2)`$, the MC mean is $\approx `r round(mc_mean, 4)`$, and the MC standard deviation is $\approx `r round(mc_std, 4)`$, both very close to the theoretical values of 0 and $\sqrt{2} \approx 1.4142$.
 
 - For **$s = 0.001$**: proposal steps are far too small, so chains barely move from their starting values. The Gelman-Rubin statistic explodes to $\hat{R} \approx `r round(rhat_values[1], 1)`$, far above the convergence threshold of 1.05.
 
